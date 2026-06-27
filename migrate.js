@@ -60,6 +60,14 @@ async function migrate() {
       );
     `);
 
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS blocked_dates (
+        date DATE PRIMARY KEY,
+        reason TEXT DEFAULT '',
+        created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+      );
+    `);
+
     console.log("Seeding default settings (only if not already present)...");
 
     // Default admin password: "riverside1" — CHANGE THIS after first login.

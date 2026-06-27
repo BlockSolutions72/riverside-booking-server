@@ -68,6 +68,11 @@ async function getBookingsForDate(client, date) {
   return result.rows;
 }
 
+async function isDateBlocked(client, date) {
+  const result = await client.query(`SELECT 1 FROM blocked_dates WHERE date = $1`, [date]);
+  return result.rows.length > 0;
+}
+
 // =================== PUBLIC ENDPOINTS ===================
 
 app.get("/api/health", (req, res) => {
@@ -81,12 +86,14 @@ app.get("/api/day/:date", async (req, res) => {
 
   const client = await pool.connect();
   try {
+    const blocked = await isDateBlocked(client, date);
     const windowRow = await getOrCreateWindow(client, date);
     const bookings = await getBookingsForDate(client, date);
-    const fromOptions = getAvailableFromOptions(windowRow, bookings);
+    const fromOptions = blocked ? [] : getAvailableFromOptions(windowRow, bookings);
 
     res.json({
       window: windowRow,
+      blocked,
       bookings: bookings.map((b) => ({
         id: b.id,
         start: b.start_time,
@@ -128,7 +135,7 @@ app.get("/api/day/:date/to-options", async (req, res) => {
   }
 });
 
-// Calendar month view — load fraction per day, for the color-coded calendar
+// Calendar month view — load fraction + blocked status per day, for the color-coded calendar
 app.get("/api/calendar/:year/:month", async (req, res) => {
   const year = Number(req.params.year);
   const month = Number(req.params.month); // 1-12
@@ -150,6 +157,10 @@ app.get("/api/calendar/:year/:month", async (req, res) => {
       `SELECT * FROM bookings WHERE date BETWEEN $1 AND $2`,
       [startDate, endDate]
     );
+    const blockedResult = await client.query(
+      `SELECT date, reason FROM blocked_dates WHERE date BETWEEN $1 AND $2`,
+      [startDate, endDate]
+    );
 
     const windowsByDate = {};
     for (const w of windowsResult.rows) {
@@ -161,10 +172,19 @@ app.get("/api/calendar/:year/:month", async (req, res) => {
       if (!bookingsByDate[key]) bookingsByDate[key] = [];
       bookingsByDate[key].push(b);
     }
+    const blockedByDate = {};
+    for (const row of blockedResult.rows) {
+      blockedByDate[row.date.toISOString().slice(0, 10)] = row.reason || "";
+    }
 
     const days = {};
     for (let d = 1; d <= daysInMonth; d++) {
       const dateStr = `${year}-${String(month).padStart(2, "0")}-${String(d).padStart(2, "0")}`;
+      const isBlocked = Object.prototype.hasOwnProperty.call(blockedByDate, dateStr);
+      if (isBlocked) {
+        days[dateStr] = { blocked: true, fraction: null };
+        continue;
+      }
       // Only compute a fraction for days that have an explicit window saved OR fall back
       // to the same default the rest of the app uses, so the calendar matches day view.
       const windowRow = windowsByDate[dateStr] || {
@@ -173,7 +193,7 @@ app.get("/api/calendar/:year/:month", async (req, res) => {
         interval_minutes: 60,
       };
       const bookings = bookingsByDate[dateStr] || [];
-      days[dateStr] = computeLoadFraction(windowRow, bookings);
+      days[dateStr] = { blocked: false, fraction: computeLoadFraction(windowRow, bookings) };
     }
 
     res.json({ days });
@@ -216,6 +236,12 @@ app.post("/api/bookings", async (req, res) => {
   const client = await pool.connect();
   try {
     await client.query("BEGIN");
+
+    const blocked = await isDateBlocked(client, date);
+    if (blocked) {
+      await client.query("ROLLBACK");
+      return res.status(409).json({ error: "This day is out of service and isn't available for booking." });
+    }
 
     const windowRow = await getOrCreateWindow(client, date);
     // Lock existing bookings for this date for the duration of this transaction so two
@@ -311,6 +337,102 @@ app.put("/api/admin/day/:date/window", requireAdmin, async (req, res) => {
   } catch (e) {
     console.error(e);
     res.status(500).json({ error: "Server error saving availability." });
+  } finally {
+    client.release();
+  }
+});
+
+// Block a range of dates (inclusive). Refuses if ANY day in the range already
+// has bookings — per product decision, blocking should only apply to future,
+// unbooked days, not silently orphan existing customer bookings.
+app.post("/api/admin/blocked-dates", requireAdmin, async (req, res) => {
+  const { startDate, endDate, reason } = req.body || {};
+  if (!isValidDate(startDate) || !isValidDate(endDate)) {
+    return res.status(400).json({ error: "Invalid date range." });
+  }
+  if (startDate > endDate) {
+    return res.status(400).json({ error: "Start date must be on or before end date." });
+  }
+
+  // Build the list of individual dates in JS rather than relying on Postgres's
+  // generate_series (some lightweight/managed Postgres-compatible engines don't
+  // implement every native function, and a plain loop is just as clear here).
+  const datesInRange = [];
+  let cursor = new Date(startDate + "T00:00:00Z");
+  const last = new Date(endDate + "T00:00:00Z");
+  const MAX_RANGE_DAYS = 366; // sanity cap against accidental huge ranges (e.g. a typo'd year)
+  while (cursor <= last) {
+    datesInRange.push(cursor.toISOString().slice(0, 10));
+    cursor = new Date(cursor.getTime() + 24 * 60 * 60 * 1000);
+    if (datesInRange.length > MAX_RANGE_DAYS) {
+      return res.status(400).json({ error: `Date range is too large (max ${MAX_RANGE_DAYS} days).` });
+    }
+  }
+
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
+
+    const bookedCheck = await client.query(
+      `SELECT DISTINCT date FROM bookings WHERE date BETWEEN $1 AND $2 ORDER BY date`,
+      [startDate, endDate]
+    );
+    if (bookedCheck.rows.length > 0) {
+      await client.query("ROLLBACK");
+      const datesList = bookedCheck.rows.map((r) => r.date.toISOString().slice(0, 10)).join(", ");
+      return res.status(409).json({
+        error: `Can't block this range — these days already have bookings: ${datesList}. Cancel those bookings first if you need to block these days.`,
+      });
+    }
+
+    for (const d of datesInRange) {
+      await client.query(
+        `INSERT INTO blocked_dates (date, reason) VALUES ($1, $2)
+         ON CONFLICT (date) DO UPDATE SET reason = EXCLUDED.reason`,
+        [d, (reason || "").trim()]
+      );
+    }
+
+    await client.query("COMMIT");
+    res.json({ ok: true });
+  } catch (e) {
+    await client.query("ROLLBACK");
+    console.error(e);
+    res.status(500).json({ error: "Server error blocking dates." });
+  } finally {
+    client.release();
+  }
+});
+
+app.delete("/api/admin/blocked-dates/:date", requireAdmin, async (req, res) => {
+  const { date } = req.params;
+  if (!isValidDate(date)) return res.status(400).json({ error: "Invalid date." });
+
+  const client = await pool.connect();
+  try {
+    await client.query(`DELETE FROM blocked_dates WHERE date = $1`, [date]);
+    res.json({ ok: true });
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: "Server error unblocking date." });
+  } finally {
+    client.release();
+  }
+});
+
+app.get("/api/admin/blocked-dates", requireAdmin, async (req, res) => {
+  const client = await pool.connect();
+  try {
+    const result = await client.query(`SELECT date, reason FROM blocked_dates ORDER BY date ASC`);
+    res.json({
+      blockedDates: result.rows.map((r) => ({
+        date: r.date.toISOString().slice(0, 10),
+        reason: r.reason || "",
+      })),
+    });
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: "Server error loading blocked dates." });
   } finally {
     client.release();
   }
