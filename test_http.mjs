@@ -54,6 +54,13 @@ async function main() {
     );
   `);
   await pool.query(`CREATE TABLE settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);`);
+  await pool.query(`
+    CREATE TABLE blocked_dates (
+      date DATE PRIMARY KEY,
+      reason TEXT DEFAULT '',
+      created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+    );
+  `);
 
   const passwordHash = await bcrypt.hash("testpass123", 10);
   await pool.query(`INSERT INTO settings (key, value) VALUES ('admin_password_hash', $1)`, [passwordHash]);
@@ -172,12 +179,63 @@ async function main() {
   // ---- calendar endpoint returns load fractions ----
   res = await request(app).get("/api/calendar/2026/8");
   check("Calendar endpoint returns 200", res.status === 200);
-  check("Calendar includes the booked day with a non-zero load", res.body.days["2026-08-01"] > 0);
-  check("Calendar includes an empty day with zero load", res.body.days["2026-08-02"] === 0);
+  check("Calendar includes the booked day with a non-zero load", res.body.days["2026-08-01"].fraction > 0);
+  check("Calendar includes an empty day with zero load", res.body.days["2026-08-02"].fraction === 0);
+  check("Calendar marks unblocked days as blocked:false", res.body.days["2026-08-02"].blocked === false);
 
   // ---- invalid date format is rejected ----
   res = await request(app).get("/api/day/not-a-date");
   check("Invalid date format rejected (400)", res.status === 400);
+
+  // ---- blocked dates feature ----
+  res = await request(app).get("/api/admin/blocked-dates").set("Authorization", `Bearer ${token}`);
+  check("Admin can list blocked dates (empty initially)", res.status === 200 && res.body.blockedDates.length === 0);
+
+  // Block a future, unbooked range
+  res = await request(app)
+    .post("/api/admin/blocked-dates")
+    .set("Authorization", `Bearer ${token}`)
+    .send({ startDate: "2026-09-10", endDate: "2026-09-12", reason: "Vacation" });
+  check("Admin can block an unbooked date range", res.status === 200 && res.body.ok === true);
+
+  res = await request(app).get("/api/admin/blocked-dates").set("Authorization", `Bearer ${token}`);
+  check("Blocked range produces 3 individual blocked dates", res.body.blockedDates.length === 3);
+
+  // The day endpoint should now report blocked:true and zero fromOptions for a blocked day
+  res = await request(app).get("/api/day/2026-09-11");
+  check("Day endpoint reports blocked:true for a blocked day", res.body.blocked === true);
+  check("Blocked day has no fromOptions", res.body.fromOptions.length === 0);
+
+  // The calendar should also reflect the block
+  res = await request(app).get("/api/calendar/2026/9");
+  check("Calendar marks blocked day as blocked:true", res.body.days["2026-09-11"].blocked === true);
+  check("Calendar gives blocked day a null fraction", res.body.days["2026-09-11"].fraction === null);
+
+  // A public booking attempt on a blocked day must be rejected server-side
+  res = await request(app).post("/api/bookings").send({
+    date: "2026-09-11", start: "10:00", end: "11:00", name: "Should Fail", phone: "555-0500",
+  });
+  check("Booking on a blocked day is rejected (409)", res.status === 409);
+
+  // Admin cannot block a range that overlaps an existing booking
+  res = await request(app)
+    .post("/api/admin/blocked-dates")
+    .set("Authorization", `Bearer ${token}`)
+    .send({ startDate: "2026-08-01", endDate: "2026-08-01" }); // this date has a real booking from earlier in the test
+  check("Blocking a date with existing bookings is rejected (409)", res.status === 409);
+
+  // Admin can unblock a date
+  res = await request(app)
+    .delete("/api/admin/blocked-dates/2026-09-11")
+    .set("Authorization", `Bearer ${token}`);
+  check("Admin can unblock a single date", res.status === 200 && res.body.ok === true);
+
+  res = await request(app).get("/api/day/2026-09-11");
+  check("Unblocked day is bookable again", res.body.blocked === false && res.body.fromOptions.length > 0);
+
+  // Unauthenticated requests to blocked-dates admin routes are rejected
+  res = await request(app).post("/api/admin/blocked-dates").send({ startDate: "2026-10-01", endDate: "2026-10-01" });
+  check("Blocking dates without auth is rejected (401)", res.status === 401);
 
   console.log(`\n${passed} passed, ${failed} failed.`);
   await pool.end();
