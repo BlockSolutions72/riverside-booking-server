@@ -48,6 +48,7 @@ async function migrate() {
         email TEXT DEFAULT '',
         address TEXT DEFAULT '',
         notes TEXT DEFAULT '',
+        reference TEXT DEFAULT '',
         created_at TIMESTAMPTZ NOT NULL DEFAULT now()
       );
     `);

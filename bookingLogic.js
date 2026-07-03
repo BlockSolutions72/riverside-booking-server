@@ -6,6 +6,27 @@
 
 export const MIN_BOOKING_LENGTH = 30; // minutes
 
+const MONTHS = ["JAN","FEB","MAR","APR","MAY","JUN","JUL","AUG","SEP","OCT","NOV","DEC"];
+
+function formatRefTime(hhmm) {
+  const [h, m] = hhmm.split(":").map(Number);
+  const period = h >= 12 ? "P" : "A";
+  const h12 = h % 12 === 0 ? 12 : h % 12;
+  return m === 0 ? `${h12}${period}` : `${h12}${String(m).padStart(2, "0")}${period}`;
+}
+
+// Generates a human-readable booking reference in the format:
+// MON(3-letter) + DD(zero-padded) + YY(2-digit) + startTime + "-" + endTime
+// e.g. JUL032680A-10A  (July 3, 2026, 8:00am–10:00am)
+//      JUL0326830A-1030A (July 3, 2026, 8:30am–10:30am)
+export function generateBookingReference(dateStr, startHHMM, endHHMM) {
+  const [year, month, day] = dateStr.split("-").map(Number);
+  const mon = MONTHS[month - 1];
+  const dd = String(day).padStart(2, "0");
+  const yy = String(year).slice(-2);
+  return `${mon}${dd}${yy}${formatRefTime(startHHMM)}-${formatRefTime(endHHMM)}`;
+}
+
 export function toMinutes(hhmm) {
   const [h, m] = hhmm.split(":").map(Number);
   return h * 60 + m;

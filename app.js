@@ -12,6 +12,7 @@ import {
   getAvailableToOptions,
   validateBookingRequest,
   computeLoadFraction,
+  generateBookingReference,
 } from "./bookingLogic.js";
 
 const DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
@@ -103,6 +104,7 @@ app.get("/api/day/:date", async (req, res) => {
         email: b.email,
         address: b.address,
         notes: b.notes,
+        reference: b.reference || generateBookingReference(b.date.toISOString().slice(0, 10), b.start_time, b.end_time),
       })),
       fromOptions,
     });
@@ -264,11 +266,13 @@ app.post("/api/bookings", async (req, res) => {
       return res.status(409).json({ error: validation.message });
     }
 
+    const reference = generateBookingReference(date, start, end);
+
     const insertResult = await client.query(
-      `INSERT INTO bookings (date, start_time, end_time, service_id, name, phone, email, address, notes)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+      `INSERT INTO bookings (date, start_time, end_time, service_id, name, phone, email, address, notes, reference)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
        RETURNING *`,
-      [date, start, end, windowRow.service_id || "detailing", name.trim(), (phone || "").trim(), (email || "").trim(), (address || "").trim(), (notes || "").trim()]
+      [date, start, end, windowRow.service_id || "detailing", name.trim(), (phone || "").trim(), (email || "").trim(), (address || "").trim(), (notes || "").trim(), reference]
     );
 
     await client.query("COMMIT");
@@ -510,7 +514,13 @@ app.get("/api/admin/bookings", requireAdmin, async (req, res) => {
       `SELECT * FROM bookings WHERE date BETWEEN $1 AND $2 ORDER BY date ASC, start_time ASC`,
       [from, to]
     );
-    res.json({ bookings: result.rows });
+    res.json({
+      bookings: result.rows.map((b) => ({
+        ...b,
+        date: b.date.toISOString().slice(0, 10),
+        reference: b.reference || generateBookingReference(b.date.toISOString().slice(0, 10), b.start_time, b.end_time),
+      })),
+    });
   } catch (e) {
     console.error(e);
     res.status(500).json({ error: "Server error." });

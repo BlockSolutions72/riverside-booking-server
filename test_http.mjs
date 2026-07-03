@@ -50,6 +50,7 @@ async function main() {
       email TEXT DEFAULT '',
       address TEXT DEFAULT '',
       notes TEXT DEFAULT '',
+      reference TEXT DEFAULT '',
       created_at TIMESTAMPTZ NOT NULL DEFAULT now()
     );
   `);
@@ -138,10 +139,13 @@ async function main() {
     date: "2026-08-01", start: "14:00", end: "15:00", name: "Second Customer", phone: "555-0400",
   });
   check("Second non-overlapping booking succeeds", res.status === 201);
+  check("Booking response includes a reference number", !!res.body.booking?.reference);
+  check("Reference format is correct (AUG01262P-3P for 2026-08-01 14:00-15:00)", res.body.booking?.reference === "AUG01262P-3P");
 
-  // ---- the day now shows 2 bookings ----
+  // ---- the day now shows 2 bookings with reference numbers ----
   res = await request(app).get("/api/day/2026-08-01");
   check("Day now shows exactly 2 bookings", res.body.bookings.length === 2);
+  check("Day endpoint returns reference numbers on bookings", res.body.bookings.every(b => !!b.reference));
 
   // ---- admin can delete a booking ----
   const bookingIdToDelete = res.body.bookings[0].id;
