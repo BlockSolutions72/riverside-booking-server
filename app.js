@@ -529,5 +529,38 @@ app.get("/api/admin/bookings", requireAdmin, async (req, res) => {
   }
 });
 
+// Search bookings by reference number, phone, or name (case-insensitive partial match)
+app.get("/api/admin/bookings/search", requireAdmin, async (req, res) => {
+  const { q } = req.query;
+  if (!q || !q.trim()) {
+    return res.status(400).json({ error: "Search query (q) is required." });
+  }
+  const term = q.trim();
+  const client = await pool.connect();
+  try {
+    const result = await client.query(
+      `SELECT * FROM bookings
+       WHERE reference ILIKE $1
+          OR phone ILIKE $1
+          OR name ILIKE $1
+       ORDER BY date DESC, start_time ASC
+       LIMIT 50`,
+      [`%${term}%`]
+    );
+    res.json({
+      bookings: result.rows.map((b) => ({
+        ...b,
+        date: b.date.toISOString().slice(0, 10),
+        reference: b.reference || generateBookingReference(b.date.toISOString().slice(0, 10), b.start_time, b.end_time),
+      })),
+    });
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: "Server error searching bookings." });
+  } finally {
+    client.release();
+  }
+});
+
   return app;
 }
