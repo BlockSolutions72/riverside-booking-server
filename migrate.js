@@ -69,6 +69,12 @@ async function migrate() {
       );
     `);
 
+    // reminder_sent: tracks whether an SMS reminder has been dispatched for this
+    // booking, so the daily cron job never double-texts the same customer.
+    await client.query(`
+      ALTER TABLE bookings ADD COLUMN IF NOT EXISTS reminder_sent BOOLEAN DEFAULT FALSE;
+    `);
+
     console.log("Seeding default settings (only if not already present)...");
 
     // Default admin password: "riverside1" — CHANGE THIS after first login.
